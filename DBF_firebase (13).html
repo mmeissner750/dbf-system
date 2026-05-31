@@ -1,0 +1,2421 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>D.B.F. — Dziennik Budowy Firmy</title>
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword, reauthenticateWithCredential, EmailAuthProvider }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getStorage, ref, uploadBytes, getDownloadURL }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+  // ============================================================
+  //  KONFIGURACJA FIREBASE
+  //  Wklej tutaj dane ze swojego projektu Firebase
+  //  (Firebase Console → Project Settings → Your apps → Config)
+  // ============================================================
+  const firebaseConfig = {
+    apiKey:            "AIzaSyBRZXEXNH_fX93OcOe9aaCrv5e9PzdtXrw",
+    authDomain:        "dbf-konsorcjum.firebaseapp.com",
+    projectId:         "dbf-konsorcjum",
+    storageBucket:     "dbf-konsorcjum.firebasestorage.app",
+    messagingSenderId: "532996063145",
+    appId:             "1:532996063145:web:692b31e7c7180a7ac20eb8",
+    measurementId:     "G-G8H95378QC"
+  };
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+  const storage = getStorage(app);
+
+  // ── DEMO MODE ─────────────────────────────────────────────
+  // Jeśli Firebase jeszcze nie skonfigurowany, system działa
+  // w trybie demo (dane lokalne, bez zapisu do chmury)
+  const DEMO = firebaseConfig.apiKey === "TWOJ_API_KEY";
+
+  // ── Liczniki ID ────────────────────────────────────────────
+  const modulCounters = {
+    KB:0, KF:0, KZM:0, DWU:0, BHP:0, UMO:0, ROB:0, PAL:0, NAR:0,
+    INI:0, KZ:0, WKZ:0
+  };
+
+  function nextId(modul) {
+    modulCounters[modul] = (modulCounters[modul] || 0) + 1;
+    return `DBF/25/${modul}/${String(modulCounters[modul]).padStart(4,'0')}`;
+  }
+
+  // ── DEMO dane startowe ─────────────────────────────────────
+  let demoSprawy = [];
+
+  let demoNotifications = [];
+
+  let dokListaAI = [];
+
+  window.podgladDokument = function(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    document.getElementById('aiDokPreview').innerHTML = `
+      <img src="${url}" style="max-width:100%;max-height:140px;border-radius:6px;border:1px solid var(--border)">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">📄 ${file.name}</div>`;
+  };
+
+  window.analizujDokument = async function() {
+    const input   = document.getElementById('aiDokInput');
+    const typ     = document.getElementById('aiDokTyp').value;
+    const budowa  = document.getElementById('aiDokBudowa').value;
+    const wynikEl = document.getElementById('aiDokWynik');
+    const statusEl= document.getElementById('aiDokStatus');
+
+    if (!input.files[0]) {
+      wynikEl.innerHTML = '<span style="color:var(--red)">⚠ Najpierw wgraj zdjęcie dokumentu.</span>';
+      return;
+    }
+
+    wynikEl.innerHTML = '<span style="color:var(--muted)">⏳ AI odczytuje dokument... (10-20 sekund)</span>';
+    statusEl.innerHTML = '';
+
+    const file = input.files[0];
+    const base64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result.split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+
+    const typNazwa = {
+      faktura: 'Faktura VAT',
+      wz: 'Dokument WZ (Wydanie Zewnętrzne)',
+      protokol: 'Protokół odbioru materiałów',
+      inny: 'Dokument przychodowy'
+    }[typ];
+
+    const prompt = `Jesteś ekspertem z branży budowlanej. Analizujesz ${typNazwa} dla budowy: ${budowa}.
+
+Odczytaj dokument ze zdjęcia i podaj w ustrukturyzowanej formie:
+
+NUMER DOKUMENTU: [numer faktury/WZ]
+DATA: [data dokumentu]
+DOSTAWCA: [nazwa firmy dostawcy]
+MATERIAŁY:
+- [nazwa materiału 1]: [ilość] [jednostka] × [cena jednostkowa] zł = [wartość] zł
+- [nazwa materiału 2]: [ilość] [jednostka] × [cena jednostkowa] zł = [wartość] zł
+(wypisz wszystkie pozycje)
+WARTOŚĆ NETTO: [suma netto] zł
+WARTOŚĆ BRUTTO: [suma brutto] zł
+VAT: [%]
+UWAGI: [ewentualne uwagi, warunki, terminy]
+
+Jeśli nie możesz odczytać jakiegoś pola — napisz "nie widoczne".
+Odpowiedz po polsku. Bądź dokładny w kwotach i nazwach materiałów.`;
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: file.type || 'image/jpeg', data: base64 } },
+              { type: 'text', text: prompt }
+            ]
+          }]
+        })
+      });
+
+      const data = await response.json();
+      const analiza = data.content?.[0]?.text || 'Błąd odczytu';
+
+      wynikEl.innerHTML = analiza.replace(/\n/g, '<br>');
+      wynikEl.style.color = 'var(--text)';
+      wynikEl.style.borderColor = 'rgba(59,130,246,0.4)';
+
+      // Parsuj dane z analizy
+      const linie = analiza.split('\n');
+      const dostawcaLinia = linie.find(l => l.includes('DOSTAWCA:'));
+      const dostawca = dostawcaLinia ? dostawcaLinia.split(':')[1]?.trim() || 'Nieznany' : 'Nieznany';
+      const dataLinia = linie.find(l => l.includes('DATA:'));
+      const dataDoc = dataLinia ? dataLinia.split(':')[1]?.trim() || new Date().toLocaleDateString('pl-PL') : new Date().toLocaleDateString('pl-PL');
+      const numerLinia = linie.find(l => l.includes('NUMER DOKUMENTU:'));
+      const numer = numerLinia ? numerLinia.split(':')[1]?.trim() || '—' : '—';
+      const bruttoLinia = linie.find(l => l.includes('WARTOŚĆ BRUTTO:'));
+      const brutto = bruttoLinia ? bruttoLinia.split(':')[1]?.trim() || '—' : '—';
+
+      const wpis = {
+        id: `DBF/25/${typ === 'faktura' ? 'KF' : 'MAT'}/${String(dokListaAI.length + 1).padStart(4,'0')}`,
+        typ: typNazwa, budowa, dostawca, dataDoc, numer, brutto,
+        tresc: analiza,
+        zdjecie: URL.createObjectURL(file),
+        ts: Date.now()
+      };
+
+      dokListaAI.unshift(wpis);
+      renderDokListaAI();
+
+      // ── ROUTING według typu dokumentu ──────────────────────
+      if (typ === 'faktura') {
+        // Faktura → KF Księgowość
+        demoSprawy.unshift({
+          id: wpis.id, modul: 'KF',
+          tytul: `Faktura VAT — ${dostawca} · ${brutto}`,
+          status: 'nowa', autor: window._currentUser || 'PTA',
+          przypisany: 'PTA', budowa, opis: analiza, ts: wpis.ts
+        });
+        showToast(`✓ Faktura ${numer} → KF Księgowość · ${brutto}`);
+
+      } else if (typ === 'wz') {
+        // WZ → MAT Materiały
+        demoMaterialy.unshift({
+          nazwa: `Dostawa WZ — ${dostawca}`,
+          ilosc: '1', jednostka: 'kpl',
+          cena_j: '0', cena_total: '0',
+          dostawca, faktura: numer,
+          budowa, data: dataDoc, ts: wpis.ts
+        });
+        renderMaterialy();
+        demoSprawy.unshift({
+          id: wpis.id, modul: 'MAT' in demoSprawy ? 'MAT' : 'KF',
+          tytul: `WZ — ${dostawca} (${budowa})`,
+          status: 'nowa', autor: window._currentUser || 'SE1',
+          przypisany: 'PTA', budowa, opis: analiza, ts: wpis.ts
+        });
+        showToast(`✓ WZ ${numer} → MAT Materiały`);
+
+      } else if (typ === 'protokol') {
+        // Protokół odbioru → MAT + KB
+        demoMaterialy.unshift({
+          nazwa: `Protokół odbioru — ${dostawca}`,
+          ilosc: '1', jednostka: 'kpl',
+          cena_j: '0', cena_total: '0',
+          dostawca, faktura: numer,
+          budowa, data: dataDoc, ts: wpis.ts
+        });
+        renderMaterialy();
+        demoSprawy.unshift({
+          id: wpis.id, modul: 'KB',
+          tytul: `Protokół odbioru materiałów — ${dostawca}`,
+          status: 'nowa', autor: window._currentUser || 'KB',
+          przypisany: 'KB', budowa, opis: analiza, ts: wpis.ts
+        });
+        showToast(`✓ Protokół odbioru → MAT Materiały + KB`);
+
+      } else {
+        // Inny dokument → KF
+        demoSprawy.unshift({
+          id: wpis.id, modul: 'KF',
+          tytul: `Dokument — ${dostawca} (${budowa})`,
+          status: 'nowa', autor: window._currentUser || 'PTA',
+          przypisany: 'PTA', budowa, opis: analiza, ts: wpis.ts
+        });
+        showToast(`✓ Dokument zarejestrowany → KF`);
+      }
+
+      renderAll();
+      statusEl.innerHTML = `<span style="color:var(--blue)">✓ ${wpis.id} zarejestrowany w ${typ === 'faktura' ? 'KF Księgowość' : typ === 'wz' ? 'MAT Materiały' : typ === 'protokol' ? 'MAT + KB' : 'KF'}</span>`;
+
+      if (!DEMO) {
+        try {
+          await addDoc(collection(db, 'dokumenty'), { ...wpis, zdjecie: null, ts: serverTimestamp() });
+        } catch(e) { console.error(e); }
+      }
+
+    } catch(e) {
+      wynikEl.innerHTML = `<span style="color:var(--red)">Błąd odczytu: ${e.message}</span>`;
+    }
+  };
+
+  function renderDokListaAI() {
+    const el = document.getElementById('dokListaAI');
+    if (!el) return;
+    if (dokListaAI.length === 0) {
+      el.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:13px;text-align:center">Brak zeskanowanych dokumentów.</div>';
+      return;
+    }
+    el.innerHTML = dokListaAI.map((d, i) => `
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;border-left:3px solid var(--blue)">
+        <div style="display:flex;gap:12px;align-items:flex-start">
+          ${d.zdjecie ? `<img src="${d.zdjecie}" style="width:60px;height:60px;object-fit:cover;border-radius:4px;flex-shrink:0">` : ''}
+          <div style="flex:1">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <span style="font-family:'Barlow Condensed',sans-serif;font-weight:700;color:var(--blue);font-size:13px">${d.id}</span>
+              <span style="font-size:11px;color:var(--muted)">${d.dataDoc} · ${d.budowa}</span>
+            </div>
+            <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px">${d.typ} — ${d.dostawca}</div>
+            <div style="font-size:11px;color:var(--muted)">Nr dokumentu: ${d.numer}</div>
+            <button onclick="rozwinDokument(${i})"
+              style="margin-top:6px;background:none;border:none;color:var(--blue);font-size:11px;cursor:pointer;padding:0">
+              Pokaż pełne dane →
+            </button>
+          </div>
+        </div>
+      </div>`).join('');
+  }
+
+  window.rozwinDokument = function(i) {
+    const d = dokListaAI[i];
+    if (!d) return;
+    document.getElementById('sprawaModalId').textContent    = d.id;
+    document.getElementById('sprawaModalTytul').textContent = `${d.typ} — ${d.dostawca}`;
+    document.getElementById('sprawaModalBudowa').textContent = d.budowa;
+    document.getElementById('sprawaModalModul').textContent = 'AI Dokument';
+    document.getElementById('sprawaModalAutor').textContent = 'AI → PTA';
+    document.getElementById('sprawaModalOpis').innerHTML    = d.tresc.replace(/\n/g,'<br>');
+    document.getElementById('sprawaModalStatus').innerHTML  = '<span class="badge badge-new">Nowa</span>';
+    document.getElementById('sprawaModalCzas').textContent  = d.dataDoc;
+    openModal('sprawaModal');
+  };
+
+  // ── AI ANALIZA ZDJĘĆ ──────────────────────────────────────
+  let dziennikaWpisy = [];
+
+  window.podgladAIZdjecie = function(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    document.getElementById('aiZdjeciePreview').innerHTML = `
+      <img src="${url}" style="max-width:100%;max-height:140px;border-radius:6px;border:1px solid var(--border)">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">📷 ${file.name}</div>`;
+  };
+
+  window.analizujZdjecie = async function() {
+    const input   = document.getElementById('aiZdjecieInput');
+    const budowa  = document.getElementById('aiBudowa').value;
+    const kontekst= document.getElementById('aiKontekst').value.trim();
+    const wynikEl = document.getElementById('aiWynik');
+    const statusEl= document.getElementById('aiStatus');
+
+    if (!input.files[0]) {
+      wynikEl.innerHTML = '<span style="color:var(--red)">⚠ Najpierw wgraj zdjęcie budowy.</span>';
+      return;
+    }
+
+    wynikEl.innerHTML = '<span style="color:var(--muted)">⏳ AI analizuje zdjęcie... (10-20 sekund)</span>';
+    statusEl.innerHTML = '';
+
+    // Konwersja zdjęcia do base64
+    const file = input.files[0];
+    const base64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result.split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+
+    const mediaType = file.type || 'image/jpeg';
+    const prompt = `Jesteś ekspertem budowlanym i analizujesz zdjęcie z budowy dla polskiej firmy budowlanej.
+${kontekst ? `Kontekst: ${kontekst}` : ''}
+Budowa: ${budowa}
+Data: ${new Date().toLocaleDateString('pl-PL')}
+
+Przeanalizuj zdjęcie i sporządź wpis do dziennika budowy zawierający:
+1. ETAP BUDOWY — co widać na zdjęciu (fundamenty, stan surowy, dach, instalacje, wykończenie itp.)
+2. STAN ROBÓT — opis postępu prac widocznych na zdjęciu
+3. MATERIAŁY — jakie materiały są widoczne
+4. PROBLEMY — czy widoczne są jakieś nieprawidłowości, pęknięcia, błędy wykonawcze (jeśli nie ma — napisz "Brak widocznych nieprawidłowości")
+5. REKOMENDACJE — co należy zrobić w następnej kolejności
+6. OCENA — ogólna ocena postępu i jakości prac (skala 1-5)
+
+Odpowiedz po polsku, w formie gotowego wpisu do dziennika budowy. Bądź konkretny i rzeczowy.`;
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+              { type: 'text', text: prompt }
+            ]
+          }]
+        })
+      });
+
+      const data = await response.json();
+      const analiza = data.content?.[0]?.text || 'Błąd analizy';
+
+      // Wyświetl wynik
+      wynikEl.innerHTML = analiza.replace(/\n/g, '<br>');
+      wynikEl.style.color = 'var(--text)';
+      wynikEl.style.borderColor = 'rgba(34,197,94,0.4)';
+
+      // Dodaj do dziennika
+      const wpis = {
+        id: `DBF/25/KB/${String(dziennikaWpisy.length + 1).padStart(4,'0')}`,
+        budowa,
+        data: new Date().toLocaleString('pl-PL'),
+        tresc: analiza,
+        zdjecie: URL.createObjectURL(file),
+        autor: window._currentUser || 'KB',
+        ts: Date.now()
+      };
+
+      dziennikaWpisy.unshift(wpis);
+      renderDziennika();
+
+      // Dodaj tylko do KB — Dziennik Budowy
+      demoSprawy.unshift({
+        id: wpis.id,
+        modul: 'KB',
+        tytul: `AI Dziennik — ${budowa} · ${new Date().toLocaleDateString('pl-PL')}`,
+        status: 'zamknieta',
+        autor: wpis.autor,
+        przypisany: 'KB',
+        budowa,
+        opis: analiza,
+        ts: wpis.ts
+      });
+      renderAll();
+
+      statusEl.innerHTML = `<span style="color:var(--green)">✓ Wpis ${wpis.id} dodany do Dziennika Budowy (KB)!</span>`;
+      showToast(`✓ AI zanalizowała zdjęcie → Dziennik Budowy ${wpis.id}`);
+
+      // Zapisz do Firebase
+      if (!DEMO) {
+        try {
+          await addDoc(collection(db, 'dziennik'), { ...wpis, zdjecie: null, ts: serverTimestamp() });
+        } catch(e) { console.error(e); }
+      }
+
+    } catch(e) {
+      wynikEl.innerHTML = `<span style="color:var(--red)">Błąd analizy: ${e.message}</span>`;
+    }
+  };
+
+  function renderDziennika() {
+    const el = document.getElementById('dziennikaLista');
+    const count = document.getElementById('dziennikaCount');
+    if (!el) return;
+    if (count) count.textContent = `${dziennikaWpisy.length} wpisów`;
+
+    if (dziennikaWpisy.length === 0) {
+      el.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:13px;text-align:center">Brak wpisów. Wgraj pierwsze zdjęcie budowy!</div>';
+      return;
+    }
+
+    el.innerHTML = dziennikaWpisy.map(w => `
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;border-left:3px solid var(--accent)">
+        <div style="display:flex;gap:12px;align-items:flex-start">
+          ${w.zdjecie ? `<img src="${w.zdjecie}" style="width:60px;height:60px;object-fit:cover;border-radius:4px;flex-shrink:0">` : ''}
+          <div style="flex:1">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <span style="font-family:'Barlow Condensed',sans-serif;font-weight:700;color:var(--accent);font-size:13px">${w.id}</span>
+              <span style="font-size:11px;color:var(--muted)">${w.data} · ${w.budowa} · ${w.autor}</span>
+            </div>
+            <div style="font-size:12px;color:var(--text);line-height:1.6;max-height:80px;overflow:hidden;position:relative">
+              ${w.tresc.replace(/\n/g,'<br>').substring(0,300)}${w.tresc.length>300?'...':''}
+            </div>
+            <button onclick="rozwinWpis(${dziennikaWpisy.indexOf(w)})"
+              style="margin-top:6px;background:none;border:none;color:var(--accent);font-size:11px;cursor:pointer;padding:0">
+              Pokaż pełny wpis →
+            </button>
+          </div>
+        </div>
+      </div>`).join('');
+  }
+
+  window.rozwinWpis = function(i) {
+    const w = dziennikaWpisy[i];
+    if (!w) return;
+    document.getElementById('sprawaModalId').textContent    = w.id;
+    document.getElementById('sprawaModalTytul').textContent = `AI Analiza — ${w.budowa}`;
+    document.getElementById('sprawaModalBudowa').textContent = w.budowa;
+    document.getElementById('sprawaModalModul').textContent = 'KB — Dziennik AI';
+    document.getElementById('sprawaModalAutor').textContent = w.autor;
+    document.getElementById('sprawaModalOpis').innerHTML    = w.tresc.replace(/\n/g,'<br>');
+    document.getElementById('sprawaModalStatus').innerHTML  = '<span class="badge badge-done">Wpis AI</span>';
+    document.getElementById('sprawaModalCzas').textContent  = w.data;
+    openModal('sprawaModal');
+  };
+
+  // ── ZDJĘCIA ───────────────────────────────────────────────
+  window.uploadZdjecie = async function(inputEl, kontener) {
+    const file = inputEl.files[0];
+    if (!file) return;
+    const el = document.getElementById(kontener);
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px">⏳ Wgrywanie...</div>';
+
+    if (DEMO) {
+      const url = URL.createObjectURL(file);
+      el.innerHTML = `<img src="${url}" style="max-width:100%;max-height:120px;border-radius:6px;margin-top:8px">
+        <div style="font-size:11px;color:var(--green);margin-top:4px">✓ Zdjęcie dodane (tryb demo)</div>`;
+      inputEl.dataset.url = url;
+      return;
+    }
+
+    try {
+      const sciezka = `zdjecia/${Date.now()}_${file.name}`;
+      const storageRef = ref(storage, sciezka);
+      await uploadBytes(storageRef, file);
+      const url = await getDownloadURL(storageRef);
+      el.innerHTML = `<img src="${url}" style="max-width:100%;max-height:120px;border-radius:6px;margin-top:8px">
+        <div style="font-size:11px;color:var(--green);margin-top:4px">✓ Zdjęcie zapisane w chmurze Firebase!</div>`;
+      inputEl.dataset.url = url;
+    } catch(e) {
+      el.innerHTML = `<div style="color:var(--red);font-size:12px">Błąd: ${e.message}</div>`;
+    }
+  };
+
+  // ── RENDEROWANIE ──────────────────────────────────────────
+  function timeAgo(ts) {
+    const diff = Date.now() - ts;
+    if (diff < 60000) return 'przed chwilą';
+    if (diff < 3600000) return Math.floor(diff/60000) + ' min temu';
+    if (diff < 86400000) return Math.floor(diff/3600000) + ' godz. temu';
+    return Math.floor(diff/86400000) + ' dni temu';
+  }
+
+  function statusBadge(s) {
+    const map = {
+      nowa: ['badge-new','Nowa'],
+      w_toku: ['badge-open','W toku'],
+      do_zatwierdzenia: ['badge-approve','Do zatwierdzenia'],
+      zamknieta: ['badge-done','Zamknięta'],
+      odrzucona: ['badge-reject','Odrzucona'],
+    };
+    const [cls, label] = map[s] || ['badge-new', s];
+    return `<span class="badge ${cls}">${label}</span>`;
+  }
+
+  function renderSprawyList(filter = '') {
+    const list = document.getElementById('sprawyList');
+    if (!list) return;
+    let data = demoSprawy;
+    if (filter) data = data.filter(s =>
+      s.modul === filter ||
+      s.tytul.toLowerCase().includes(filter.toLowerCase()) ||
+      s.id.toLowerCase().includes(filter.toLowerCase())
+    );
+    data = [...data].sort((a,b) => b.ts - a.ts);
+    list.innerHTML = data.map(s => `
+      <div class="sprawa-row" onclick="openSprawa('${s.id}')">
+        <div class="sprawa-id">${s.id}</div>
+        <div class="sprawa-name">${s.tytul}</div>
+        ${statusBadge(s.status)}
+        <div class="sprawa-who">${s.autor}→${s.przypisany}</div>
+      </div>`).join('');
+  }
+
+  function renderDashboardSprawy() {
+    const el = document.getElementById('dashSprawy');
+    if (!el) return;
+    const data = [...demoSprawy].sort((a,b) => b.ts - a.ts).slice(0,6);
+    el.innerHTML = data.map(s => `
+      <div class="sprawa-row" onclick="openSprawa('${s.id}')">
+        <div class="sprawa-id">${s.id}</div>
+        <div class="sprawa-name">${s.tytul}</div>
+        ${statusBadge(s.status)}
+        <div class="sprawa-who">${s.autor}</div>
+      </div>`).join('');
+  }
+
+  function renderNotifications() {
+    const el = document.getElementById('notifList');
+    const badge = document.getElementById('notifBadge');
+    const modalList = document.getElementById('notifModalList');
+    const unread = demoNotifications.filter(n => !n.przeczytana).length;
+    if (badge) badge.textContent = unread > 0 ? unread : '';
+    if (badge) badge.style.display = unread > 0 ? 'block' : 'none';
+
+    const html = demoNotifications.map((n,i) => `
+      <div class="notif-item ${n.przeczytana ? '' : 'unread'}" onclick="markRead(${i})">
+        <div class="notif-dot2 ${n.kolor}"></div>
+        <div class="notif-body">
+          <div class="notif-text">${n.tekst}</div>
+          <div class="notif-time">${timeAgo(n.czas)} · od: ${n.od}</div>
+        </div>
+      </div>`).join('');
+
+    if (el) el.innerHTML = html;
+    if (modalList) modalList.innerHTML = html;
+  }
+
+  function renderStats() {
+    const total = demoSprawy.length;
+    const doZatw = demoSprawy.filter(s => s.status === 'do_zatwierdzenia').length;
+    const wToku  = demoSprawy.filter(s => s.status === 'w_toku').length;
+    const nowe   = demoSprawy.filter(s => s.status === 'nowa').length;
+    const el = id => document.getElementById(id);
+    if (el('statTotal'))  el('statTotal').textContent  = total;
+    if (el('statZatw'))   el('statZatw').textContent   = doZatw;
+    if (el('statToku'))   el('statToku').textContent   = wToku;
+    if (el('statNowe'))   el('statNowe').textContent   = nowe;
+  }
+
+  // ── GLOBALNE FUNKCJE (dostępne z HTML) ───────────────────
+  window.openSprawa = function(id) {
+    const s = demoSprawy.find(x => x.id === id);
+    if (!s) return;
+    document.getElementById('sprawaModalId').textContent    = s.id;
+    document.getElementById('sprawaModalTytul').textContent = s.tytul;
+    document.getElementById('sprawaModalBudowa').textContent = s.budowa;
+    document.getElementById('sprawaModalModul').textContent = s.modul;
+    document.getElementById('sprawaModalAutor').textContent = `${s.autor} → ${s.przypisany}`;
+    document.getElementById('sprawaModalOpis').textContent  = s.opis;
+    document.getElementById('sprawaModalStatus').innerHTML  = statusBadge(s.status);
+    document.getElementById('sprawaModalCzas').textContent  = timeAgo(s.ts);
+    document.getElementById('sprawaModal').classList.add('open');
+  };
+
+  window.zatwierdz = function() {
+    const id = document.getElementById('sprawaModalId').textContent;
+    const s = demoSprawy.find(x => x.id === id);
+    if (s) {
+      s.status = 'zamknieta';
+      renderAll();
+      showToast('✓ Sprawa zatwierdzona i zamknięta. Powiadomienia wysłane.');
+    }
+    closeModal('sprawaModal');
+    if (!DEMO) {
+      const ref = doc(db, 'sprawy', id);
+      updateDoc(ref, { status: 'zamknieta' }).catch(console.error);
+    }
+  };
+
+  window.odrzuc = function() {
+    const id = document.getElementById('sprawaModalId').textContent;
+    const s = demoSprawy.find(x => x.id === id);
+    if (s) {
+      s.status = 'odrzucona';
+      renderAll();
+      showToast('✗ Sprawa odrzucona. Powiadomienia wysłane.');
+    }
+    closeModal('sprawaModal');
+  };
+
+  window.markRead = function(i) {
+    demoNotifications[i].przeczytana = true;
+    renderNotifications();
+  };
+
+  window.markAllRead = function() {
+    demoNotifications.forEach(n => n.przeczytana = true);
+    renderNotifications();
+    showToast('Wszystkie powiadomienia oznaczone jako przeczytane.');
+  };
+
+  window.filterSprawy = function(val) {
+    renderSprawyList(val);
+  };
+
+  window.searchSprawy = function(val) {
+    renderSprawyList(val);
+  };
+
+  window.submitNowaSprawa = async function() {
+    const modul    = document.getElementById('nsModul').value;
+    const budowa   = document.getElementById('nsBudowa').value;
+    const tytul    = document.getElementById('nsTytul').value.trim();
+    const opis     = document.getElementById('nsOpis').value.trim();
+    const przypisz = document.getElementById('nsPrzypiszDo').value;
+
+    if (!modul || !tytul) {
+      showToast('⚠ Wypełnij moduł i tytuł sprawy.', 'warn');
+      return;
+    }
+
+    const newId = nextId(modul);
+    const sprawa = {
+      id: newId, modul, budowa, tytul, opis,
+      status: 'nowa',
+      autor: window._currentUser || 'KB',
+      przypisany: przypisz,
+      ts: Date.now()
+    };
+
+    demoSprawy.unshift(sprawa);
+
+    // powiadomienie
+    demoNotifications.unshift({
+      tekst: `Nowa sprawa <b>${newId}</b> — ${tytul}`,
+      od: window._currentUser || 'KB',
+      czas: Date.now(),
+      przeczytana: false,
+      kolor: 'blue'
+    });
+
+    if (!DEMO) {
+      try {
+        await addDoc(collection(db, 'sprawy'), {
+          ...sprawa, ts: serverTimestamp()
+        });
+      } catch(e) { console.error(e); }
+    }
+
+    renderAll();
+    closeModal('nowaSprawaModal');
+    showToast(`✓ Sprawa ${newId} utworzona. Powiadomienia wysłane do: ${przypisz}.`);
+
+    // reset form
+    ['nsModul','nsBudowa','nsTytul','nsOpis'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = el.tagName === 'SELECT' ? el.options[0].value : '';
+    });
+    document.getElementById('generatedId').textContent = 'DBF/25/???/0000';
+  };
+
+  window.updateId = function(val) {
+    const n = (modulCounters[val] || 0) + 1;
+    document.getElementById('generatedId').textContent =
+      val ? `DBF/25/${val}/${String(n).padStart(4,'0')}` : 'DBF/25/???/0000';
+  };
+
+  // ── LOGIN ─────────────────────────────────────────────────
+  window.doLogin = async function() {
+    const email = document.getElementById('loginEmail').value.trim();
+    const pass  = document.getElementById('loginPass').value;
+    const err   = document.getElementById('loginError');
+    err.textContent = '';
+
+    if (DEMO) {
+      // demo login - any credentials work
+      window._currentUser = email.split('@')[0].toUpperCase() || 'KB';
+      document.getElementById('userLabel').textContent =
+        (email.split('@')[0] || 'Demo') + ' · KB';
+      showApp();
+      return;
+    }
+
+    try {
+      const cred = await signInWithEmailAndPassword(auth, email, pass);
+      window._currentUser = cred.user.email.split('@')[0].toUpperCase();
+      document.getElementById('userLabel').textContent =
+        cred.user.email.split('@')[0] + ' · KB';
+      showApp();
+    } catch(e) {
+      err.textContent = 'Błędny email lub hasło.';
+    }
+  };
+
+  // ── USTAWIENIA FIRMY ──────────────────────────────────────
+  let ustawienia = {
+    nazwa1: 'MP Budownictwo Finanse sp. z o.o.',
+    nazwa2: 'Artbud sp. z o.o.',
+    nip: '',
+    adres: '',
+    telefon: '',
+    email: '',
+    budowy: ['Budowa 1', 'Budowa 2', 'Budowa 3', 'Budowa 4']
+  };
+
+  function aktualizujNazwyWSystemie() {
+    const konsorcjum = ustawienia.nazwa2
+      ? `${ustawienia.nazwa1} & ${ustawienia.nazwa2}`
+      : ustawienia.nazwa1;
+    document.querySelectorAll('.consortium').forEach(el => {
+      el.innerHTML = `Konsorcjum: <strong style="color:var(--text)">${ustawienia.nazwa1}</strong>${ustawienia.nazwa2 ? ` &amp; <strong style="color:var(--text)">${ustawienia.nazwa2}</strong>` : ''}`;
+    });
+    document.querySelectorAll('.logo-sub').forEach(el => {
+      el.textContent = konsorcjum;
+    });
+    // aktualizuj budowy w selectach
+    document.querySelectorAll('select[id$="Budowa"], select[id="nsBudowa"], select[id="uBudowa"], select[id="matBudowa"]').forEach(sel => {
+      const val = sel.value;
+      sel.innerHTML = ustawienia.budowy.map(b => `<option>${b}</option>`).join('');
+      sel.value = val;
+    });
+  }
+
+  window.zapiszUstawienia = async function() {
+    ustawienia.nazwa1  = document.getElementById('uNazwa1').value.trim() || ustawienia.nazwa1;
+    ustawienia.nazwa2  = document.getElementById('uNazwa2').value.trim();
+    ustawienia.nip     = document.getElementById('uNip').value.trim();
+    ustawienia.adres   = document.getElementById('uAdres').value.trim();
+    ustawienia.telefon = document.getElementById('uTelefon').value.trim();
+    ustawienia.email   = document.getElementById('uEmailFirmy').value.trim();
+
+    // budowy
+    const budowyRaw = document.getElementById('uBudowyLista').value;
+    ustawienia.budowy = budowyRaw.split('\n').map(b => b.trim()).filter(b => b.length > 0);
+
+    aktualizujNazwyWSystemie();
+
+    if (!DEMO) {
+      try {
+        await addDoc(collection(db, 'ustawienia'), { ...ustawienia, ts: serverTimestamp() });
+      } catch(e) { console.error(e); }
+    }
+
+    showToast('✓ Ustawienia firmy zapisane!');
+  };
+
+  // ── MATERIAŁY ─────────────────────────────────────────────
+  let demoMaterialy = [];
+  let demoKosztorys = [];
+
+  function renderMaterialy() {
+    const lista = document.getElementById('matLista');
+    const summary = document.getElementById('matSummary');
+    if (!lista) return;
+
+    if (demoMaterialy.length === 0) {
+      lista.innerHTML = '<div style="padding:18px;color:var(--muted);font-size:13px">Brak zakupów. Dodaj pierwszy materiał.</div>';
+    } else {
+      lista.innerHTML = demoMaterialy.map((m, i) => `
+        <div class="sprawa-row">
+          <div class="sprawa-id" style="width:120px">${m.data}</div>
+          <div class="sprawa-name">
+            <div style="font-weight:600">${m.nazwa}</div>
+            <div style="font-size:11px;color:var(--muted)">${m.dostawca} · Faktura: ${m.faktura || '—'}</div>
+          </div>
+          <div style="font-size:12px;color:var(--text);white-space:nowrap">${m.ilosc} ${m.jednostka}</div>
+          <div style="font-size:12px;font-weight:600;color:var(--accent);white-space:nowrap">${Number(m.cena_total).toLocaleString('pl')} zł</div>
+          <span class="badge badge-open">${m.budowa}</span>
+          <button onclick="usunMaterial(${i})" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#f87171;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px">Usuń</button>
+        </div>`).join('');
+    }
+
+    // Podsumowanie
+    const totalZakup = demoMaterialy.reduce((s, m) => s + Number(m.cena_total), 0);
+    const totalKoszt = demoKosztorys.reduce((s, k) => s + Number(k.wartosc), 0);
+    const roznica = totalKoszt - totalZakup;
+    const procent = totalKoszt > 0 ? Math.round((totalZakup / totalKoszt) * 100) : 0;
+    const kolor = roznica >= 0 ? 'var(--green)' : 'var(--red)';
+
+    if (summary) summary.innerHTML = `
+      <div class="stats-grid" style="margin-bottom:0">
+        <div class="stat-card blue">
+          <div class="stat-label">Zakupiono łącznie</div>
+          <div class="stat-value" style="font-size:22px">${totalZakup.toLocaleString('pl')} zł</div>
+          <div class="stat-sub">${demoMaterialy.length} pozycji</div>
+        </div>
+        <div class="stat-card orange">
+          <div class="stat-label">Kosztorys materiałów</div>
+          <div class="stat-value" style="font-size:22px">${totalKoszt.toLocaleString('pl')} zł</div>
+          <div class="stat-sub">${demoKosztorys.length} pozycji</div>
+        </div>
+        <div class="stat-card ${roznica >= 0 ? 'green' : 'red'}">
+          <div class="stat-label">Pozostało w budżecie</div>
+          <div class="stat-value" style="font-size:22px;color:${kolor}">${roznica.toLocaleString('pl')} zł</div>
+          <div class="stat-sub">Wykorzystano ${procent}% budżetu</div>
+        </div>
+      </div>`;
+
+    // Porównanie z kosztorysem
+    const porownanie = document.getElementById('matPorownanie');
+    if (porownanie && demoKosztorys.length > 0) {
+      porownanie.innerHTML = demoKosztorys.map(k => {
+        const zakupy = demoMaterialy.filter(m => m.nazwa.toLowerCase().includes(k.nazwa.toLowerCase()));
+        const zakupiono = zakupy.reduce((s, m) => s + Number(m.ilosc), 0);
+        const proc = k.ilosc > 0 ? Math.round((zakupiono / k.ilosc) * 100) : 0;
+        const kol = proc > 100 ? 'var(--red)' : proc > 80 ? 'var(--yellow)' : 'var(--green)';
+        return `
+          <div class="sprawa-row">
+            <div class="sprawa-name"><strong>${k.nazwa}</strong></div>
+            <div style="font-size:12px;color:var(--muted)">${k.ilosc} ${k.jednostka} plan</div>
+            <div style="font-size:12px">${zakupiono} ${k.jednostka} zakup.</div>
+            <div style="font-size:12px;font-weight:700;color:${kol}">${proc}%</div>
+            <div class="progress-bar" style="width:100px;margin:0">
+              <div class="progress-fill" style="width:${Math.min(proc,100)}%;background:${kol}"></div>
+            </div>
+          </div>`;
+      }).join('');
+    } else if (porownanie) {
+      porownanie.innerHTML = '<div style="padding:18px;color:var(--muted);font-size:13px">Dodaj pozycje kosztorysowe żeby zobaczyć porównanie.</div>';
+    }
+  }
+
+  window.dodajMaterial = async function() {
+    const nazwa    = document.getElementById('matNazwa').value.trim();
+    const ilosc    = document.getElementById('matIlosc').value;
+    const jednostka= document.getElementById('matJednostka').value;
+    const cena_j   = document.getElementById('matCenaJ').value;
+    const dostawca = document.getElementById('matDostawca').value.trim();
+    const faktura  = document.getElementById('matFaktura').value.trim();
+    const budowa   = document.getElementById('matBudowa').value;
+    const data     = document.getElementById('matData').value;
+    const err      = document.getElementById('matError');
+    err.textContent = '';
+
+    if (!nazwa || !ilosc || !cena_j || !dostawca || !data) {
+      err.textContent = 'Wypełnij wszystkie wymagane pola.'; return;
+    }
+
+    const cena_total = (parseFloat(ilosc) * parseFloat(cena_j)).toFixed(2);
+    const mat = { nazwa, ilosc, jednostka, cena_j, cena_total, dostawca, faktura, budowa, data, ts: Date.now() };
+    demoMaterialy.push(mat);
+
+    if (!DEMO) {
+      try { await addDoc(collection(db, 'materialy'), { ...mat, ts: serverTimestamp() }); }
+      catch(e) { console.error(e); }
+    }
+
+    renderMaterialy();
+    closeModal('dodajMaterialModal');
+    showToast(`✓ Materiał "${nazwa}" dodany — ${cena_total} zł`);
+    ['matNazwa','matIlosc','matCenaJ','matDostawca','matFaktura','matData'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+  };
+
+  window.dodajKosztorys = function() {
+    const nazwa    = document.getElementById('kNazwa').value.trim();
+    const ilosc    = document.getElementById('kIlosc').value;
+    const jednostka= document.getElementById('kJednostka').value;
+    const wartosc  = document.getElementById('kWartosc').value;
+    const err      = document.getElementById('kError');
+    err.textContent = '';
+
+    if (!nazwa || !ilosc || !wartosc) {
+      err.textContent = 'Wypełnij wszystkie wymagane pola.'; return;
+    }
+
+    demoKosztorys.push({ nazwa, ilosc, jednostka, wartosc, ts: Date.now() });
+    renderMaterialy();
+    closeModal('kosztorysModal');
+    showToast(`✓ Pozycja "${nazwa}" dodana do kosztorysu.`);
+    ['kNazwa','kIlosc','kWartosc'].forEach(id => document.getElementById(id).value = '');
+  };
+
+  window.usunMaterial = function(i) {
+    const m = demoMaterialy[i];
+    if (confirm(`Usunąć "${m.nazwa}"?`)) {
+      demoMaterialy.splice(i, 1);
+      renderMaterialy();
+      showToast(`Materiał "${m.nazwa}" usunięty.`);
+    }
+  };
+  let demoUzytkownicy = [];
+
+  function renderUzytkownicy() {
+    const el = document.getElementById('uzytkownicyList');
+    if (!el) return;
+    if (demoUzytkownicy.length === 0) {
+      el.innerHTML = '<div style="padding:18px;color:var(--muted);font-size:13px">Brak użytkowników. Dodaj pierwszego.</div>';
+      return;
+    }
+    el.innerHTML = demoUzytkownicy.map((u, i) => `
+      <div class="sprawa-row">
+        <div class="user-avatar" style="width:32px;height:32px;flex-shrink:0;font-size:11px">${u.inicjaly}</div>
+        <div class="sprawa-name">
+          <div style="font-weight:600">${u.imie} ${u.nazwisko}</div>
+          <div style="font-size:11px;color:var(--muted)">${u.email}</div>
+        </div>
+        <span class="badge badge-open">${u.rola}</span>
+        <div class="sprawa-who">${u.budowa || 'Wszystkie'}</div>
+        <button onclick="usunUzytkownika(${i})" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#f87171;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px">Usuń</button>
+      </div>`).join('');
+  }
+
+  window.dodajUzytkownika = async function() {
+    const imie    = document.getElementById('uImie').value.trim();
+    const nazwisko= document.getElementById('uNazwisko').value.trim();
+    const email   = document.getElementById('uEmail').value.trim();
+    const rola    = document.getElementById('uRola').value;
+    const budowa  = document.getElementById('uBudowa').value;
+    const err     = document.getElementById('uError');
+    const ok      = document.getElementById('uOk');
+    err.textContent = '';
+    ok.textContent  = '';
+
+    if (!imie || !nazwisko || !email || !rola) {
+      err.textContent = 'Wypełnij wszystkie wymagane pola.'; return;
+    }
+
+    const inicjaly = (imie[0] + nazwisko[0]).toUpperCase();
+    const nowy = { imie, nazwisko, email, rola, budowa, inicjaly, ts: Date.now() };
+    demoUzytkownicy.push(nowy);
+
+    if (!DEMO) {
+      try {
+        await addDoc(collection(db, 'uzytkownicy'), { ...nowy, ts: serverTimestamp() });
+      } catch(e) { console.error(e); }
+    }
+
+    renderUzytkownicy();
+    ok.textContent = `✓ Użytkownik ${imie} ${nazwisko} dodany!`;
+    showToast(`✓ ${imie} ${nazwisko} (${rola}) dodany do systemu.`);
+
+    // reset
+    ['uImie','uNazwisko','uEmail'].forEach(id => document.getElementById(id).value = '');
+    setTimeout(() => { ok.textContent = ''; }, 2000);
+  };
+
+  window.usunUzytkownika = function(i) {
+    const u = demoUzytkownicy[i];
+    if (confirm(`Usunąć użytkownika ${u.imie} ${u.nazwisko}?`)) {
+      demoUzytkownicy.splice(i, 1);
+      renderUzytkownicy();
+      showToast(`Użytkownik ${u.imie} ${u.nazwisko} usunięty.`);
+    }
+  };
+
+  window.doLogout = async function() {
+    if (!DEMO) await signOut(auth);
+    showLogin();
+  };
+
+  window.zmienHaslo = async function() {
+    const stare  = document.getElementById('starHaslo').value;
+    const nowe   = document.getElementById('noweHaslo').value;
+    const powt   = document.getElementById('powtHaslo').value;
+    const err    = document.getElementById('hasloError');
+    const ok     = document.getElementById('hasloOk');
+    err.textContent = '';
+    ok.textContent  = '';
+
+    if (!stare || !nowe || !powt) {
+      err.textContent = 'Wypełnij wszystkie pola.'; return;
+    }
+    if (nowe.length < 6) {
+      err.textContent = 'Nowe hasło musi mieć min. 6 znaków.'; return;
+    }
+    if (nowe !== powt) {
+      err.textContent = 'Nowe hasła nie są identyczne.'; return;
+    }
+
+    if (DEMO) {
+      ok.textContent = '✓ Hasło zmienione (tryb demo).';
+      setTimeout(() => closeModal('hasloModal'), 1500);
+      return;
+    }
+
+    try {
+      const user = auth.currentUser;
+      const cred = EmailAuthProvider.credential(user.email, stare);
+      await reauthenticateWithCredential(user, cred);
+      await updatePassword(user, nowe);
+      ok.textContent = '✓ Hasło zostało zmienione!';
+      setTimeout(() => closeModal('hasloModal'), 1500);
+    } catch(e) {
+      if (e.code === 'auth/wrong-password') {
+        err.textContent = 'Stare hasło jest nieprawidłowe.';
+      } else {
+        err.textContent = 'Błąd: ' + e.message;
+      }
+    }
+  };
+
+  window.loginEnter = function(e) {
+    if (e.key === 'Enter') doLogin();
+  };
+
+  window.pokazRejestracje = function() {
+    document.getElementById('loginForm').style.display = 'none';
+    document.getElementById('rejestracjaForm').style.display = 'block';
+    document.getElementById('regError').textContent = '';
+  };
+
+  window.pokazLogowanie = function() {
+    document.getElementById('rejestracjaForm').style.display = 'none';
+    document.getElementById('loginForm').style.display = 'block';
+    document.getElementById('loginError').textContent = '';
+  };
+
+  window.doRejestracja = async function() {
+    const nazwa  = document.getElementById('regNazwaFirmy').value.trim();
+    const email  = document.getElementById('regEmail').value.trim();
+    const haslo  = document.getElementById('regHaslo').value;
+    const haslo2 = document.getElementById('regHaslo2').value;
+    const err    = document.getElementById('regError');
+    err.textContent = '';
+
+    if (!nazwa || !email || !haslo || !haslo2) {
+      err.textContent = 'Wypełnij wszystkie pola.'; return;
+    }
+    if (haslo.length < 6) {
+      err.textContent = 'Hasło musi mieć min. 6 znaków.'; return;
+    }
+    if (haslo !== haslo2) {
+      err.textContent = 'Hasła nie są identyczne.'; return;
+    }
+
+    if (DEMO) {
+      window._currentUser = email.split('@')[0].toUpperCase();
+      document.getElementById('userLabel').textContent = email.split('@')[0] + ' · W1';
+      showApp();
+      showToast(`✓ Konto dla "${nazwa}" utworzone! Witaj w D.B.F.`);
+      return;
+    }
+
+    try {
+      const { createUserWithEmailAndPassword } = await import(
+        "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js"
+      );
+      const cred = await createUserWithEmailAndPassword(auth, email, haslo);
+      await addDoc(collection(db, 'firmy'), {
+        nazwa, email, uid: cred.user.uid, plan: 'trial',
+        dataRejestracji: serverTimestamp()
+      });
+      window._currentUser = email.split('@')[0].toUpperCase();
+      document.getElementById('userLabel').textContent = email.split('@')[0] + ' · W1';
+      showApp();
+      showToast(`✓ Konto dla "${nazwa}" utworzone! Witaj w D.B.F.`);
+    } catch(e) {
+      if (e.code === 'auth/email-already-in-use') {
+        err.textContent = 'Ten email jest już zarejestrowany.';
+      } else {
+        err.textContent = 'Błąd: ' + e.message;
+      }
+    }
+  };
+
+  function showApp() {
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('appScreen').style.display = 'flex';
+    renderAll();
+    if (DEMO) showDemoBanner();
+  }
+
+  function showLogin() {
+    document.getElementById('loginScreen').style.display = 'flex';
+    document.getElementById('appScreen').style.display = 'none';
+  }
+
+  function showDemoBanner() {
+    const b = document.getElementById('demoBanner');
+    if (b) b.style.display = 'flex';
+  }
+
+  // ── RENDER ALL ────────────────────────────────────────────
+  function renderAll() {
+    renderSprawyList();
+    renderDashboardSprawy();
+    renderNotifications();
+    renderStats();
+    renderUzytkownicy();
+    renderMaterialy();
+  }
+
+  // ── AUTH LISTENER ─────────────────────────────────────────
+  if (!DEMO) {
+    onAuthStateChanged(auth, user => {
+      if (user) {
+        window._currentUser = user.email.split('@')[0].toUpperCase();
+        document.getElementById('userLabel').textContent =
+          user.email.split('@')[0] + ' · KB';
+        showApp();
+      } else {
+        showLogin();
+      }
+    });
+  }
+
+  // ── TOAST ─────────────────────────────────────────────────
+  window.showToast = function(msg, type='ok') {
+    let t = document.getElementById('toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.className = 'toast show ' + type;
+    clearTimeout(window._toastTimer);
+    window._toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+  };
+
+  // ── MODAL HELPERS ─────────────────────────────────────────
+  window.openModal  = id => document.getElementById(id)?.classList.add('open');
+  window.closeModal = id => document.getElementById(id)?.classList.remove('open');
+  window.showTab    = function(name) {
+    document.querySelectorAll('.tab-content:not(.pta-sub)').forEach(t => t.classList.remove('active'));
+    document.getElementById('tab-' + name)?.classList.add('active');
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  };
+  window.switchPtaTab = function(el, name) {
+    document.querySelectorAll('.tabs .tab').forEach(t => t.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('[id^="pta-"]').forEach(t => t.classList.remove('active'));
+    document.getElementById('pta-' + name)?.classList.add('active');
+  };
+
+  document.addEventListener('click', e => {
+    if (e.target.classList.contains('modal-overlay')) {
+      e.target.classList.remove('open');
+    }
+  });
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@300;400;500;600&display=swap');
+
+:root {
+  --bg:#0f1117; --bg2:#181c25; --bg3:#1e2330; --border:#2a3044;
+  --accent:#f5a623; --blue:#3b82f6; --green:#22c55e;
+  --red:#ef4444; --yellow:#eab308; --purple:#a78bfa;
+  --text:#e8eaf0; --muted:#6b7280; --card:#1a1f2e;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Barlow',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+
+/* ── LOGIN ─────────────────────────── */
+#loginScreen{
+  display:flex;align-items:center;justify-content:center;
+  min-height:100vh;
+  background:radial-gradient(ellipse at 30% 20%, rgba(245,166,35,0.08) 0%, transparent 60%),
+             radial-gradient(ellipse at 80% 80%, rgba(59,130,246,0.06) 0%, transparent 60%),
+             var(--bg);
+}
+.login-box{
+  width:400px;
+  background:var(--bg2);
+  border:1px solid var(--border);
+  border-top:3px solid var(--accent);
+  border-radius:14px;
+  padding:40px;
+  box-shadow:0 24px 80px rgba(0,0,0,0.5);
+}
+.login-logo{
+  display:flex;align-items:center;gap:14px;margin-bottom:8px;
+}
+.login-badge{
+  background:var(--accent);color:#000;
+  font-family:'Barlow Condensed',sans-serif;
+  font-weight:900;font-size:28px;letter-spacing:3px;
+  padding:6px 16px;
+  clip-path:polygon(0 0,95% 0,100% 100%,5% 100%);
+}
+.login-title{font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:700;letter-spacing:1px;color:var(--muted)}
+.login-company{font-size:11px;color:var(--muted);line-height:1.6;margin-bottom:32px;padding-left:4px}
+.login-company strong{color:var(--text)}
+.form-label{display:block;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.form-input,.form-select,.form-textarea{
+  width:100%;background:var(--bg3);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);padding:10px 14px;
+  font-family:'Barlow',sans-serif;font-size:14px;outline:none;
+  transition:border-color .2s;
+}
+.form-input:focus,.form-select:focus,.form-textarea:focus{border-color:var(--accent)}
+.form-select option{background:var(--bg2)}
+.form-textarea{resize:vertical;min-height:80px}
+.form-group{margin-bottom:18px}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.login-error{color:var(--red);font-size:12px;margin-bottom:12px;min-height:16px}
+.btn{padding:9px 20px;border-radius:6px;border:none;cursor:pointer;font-family:'Barlow',sans-serif;font-weight:600;font-size:13px;transition:all .2s}
+.btn-primary{background:var(--accent);color:#000;width:100%;padding:12px;font-size:15px}
+.btn-primary:hover{background:#e09b1e}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ── APP ───────────────────────────── */
+#appScreen{display:none;flex-direction:column;min-height:100vh}
+
+/* DEMO BANNER */
+#demoBanner{
+  display:none;background:rgba(245,166,35,0.12);border-bottom:1px solid rgba(245,166,35,0.3);
+  padding:8px 24px;font-size:12px;align-items:center;gap:10px;color:var(--accent)
+}
+
+/* TOPBAR */
+.topbar{
+  background:var(--bg2);border-bottom:2px solid var(--accent);
+  padding:0 24px;height:56px;display:flex;align-items:center;
+  justify-content:space-between;position:sticky;top:0;z-index:100;flex-shrink:0;
+}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-badge{background:var(--accent);color:#000;font-family:'Barlow Condensed',sans-serif;font-weight:900;font-size:20px;letter-spacing:2px;padding:4px 10px;clip-path:polygon(0 0,95% 0,100% 100%,5% 100%)}
+.logo-sub{font-size:9px;color:var(--muted);letter-spacing:.5px;margin-top:1px}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.notif-btn{position:relative;background:var(--bg3);border:1px solid var(--border);color:var(--text);width:36px;height:36px;border-radius:8px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.notif-btn:hover{border-color:var(--accent)}
+#notifBadge{position:absolute;top:-4px;right:-4px;background:var(--red);color:#fff;font-size:9px;font-weight:700;padding:1px 5px;border-radius:10px;min-width:16px;text-align:center}
+.user-pill{background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:4px 14px 4px 4px;display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;font-weight:500;transition:border-color .2s}
+.user-pill:hover{border-color:var(--accent)}
+.user-avatar{width:28px;height:28px;background:var(--accent);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;color:#000}
+
+/* LAYOUT */
+.layout{display:flex;flex:1}
+.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);padding:16px 0;flex-shrink:0;display:flex;flex-direction:column}
+.sidebar-section{padding:8px 16px 4px;font-size:10px;font-weight:700;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-top:8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer;border-left:3px solid transparent;transition:all .15s;color:var(--muted)}
+.nav-item:hover{background:var(--bg3);color:var(--text);border-left-color:var(--border)}
+.nav-item.active{background:rgba(245,166,35,.08);color:var(--accent);border-left-color:var(--accent)}
+.nav-item .icon{font-size:15px;width:18px;text-align:center}
+.nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:10px;font-weight:700;padding:1px 6px;border-radius:10px}
+.nav-badge.yellow{background:var(--yellow);color:#000}
+.nav-badge.green{background:var(--green)}
+
+/* MAIN */
+.main{flex:1;padding:24px;overflow-y:auto}
+.page-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px}
+.page-title{font-family:'Barlow Condensed',sans-serif;font-size:28px;font-weight:700;letter-spacing:1px;line-height:1}
+.page-sub{font-size:11px;color:var(--muted);margin-top:4px}
+.consortium{font-size:12px;font-weight:600;color:var(--text);margin-top:2px}
+
+/* TAB CONTENT */
+.tab-content{display:none}
+.tab-content.active{display:block}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px 20px;position:relative;overflow:hidden;transition:border-color .2s}
+.stat-card:hover{border-color:var(--accent)}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.stat-card.orange::before{background:var(--accent)}
+.stat-card.blue::before{background:var(--blue)}
+.stat-card.green::before{background:var(--green)}
+.stat-card.red::before{background:var(--red)}
+.stat-label{font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.stat-value{font-family:'Barlow Condensed',sans-serif;font-size:32px;font-weight:700;line-height:1;margin-bottom:6px}
+.stat-sub{font-size:11px;color:var(--muted)}
+.stat-icon{position:absolute;right:16px;top:50%;transform:translateY(-50%);font-size:32px;opacity:.08}
+
+/* CARDS */
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:16px}
+.card-header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.card-body{padding:16px 18px}
+
+/* SPRAWY */
+.sprawa-list{display:flex;flex-direction:column}
+.sprawa-row{display:flex;align-items:center;padding:11px 18px;border-bottom:1px solid var(--border);gap:12px;cursor:pointer;transition:background .15s;font-size:13px}
+.sprawa-row:last-child{border-bottom:none}
+.sprawa-row:hover{background:rgba(255,255,255,.03)}
+.sprawa-id{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:12px;color:var(--accent);white-space:nowrap;width:148px;flex-shrink:0}
+.sprawa-name{flex:1;font-weight:500}
+.sprawa-who{font-size:11px;color:var(--muted);width:80px;text-align:right;flex-shrink:0}
+
+/* BADGES */
+.badge{padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;white-space:nowrap}
+.badge-new{background:rgba(59,130,246,.2);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+.badge-open{background:rgba(234,179,8,.15);color:#fbbf24;border:1px solid rgba(234,179,8,.3)}
+.badge-approve{background:rgba(245,166,35,.15);color:var(--accent);border:1px solid rgba(245,166,35,.3)}
+.badge-done{background:rgba(34,197,94,.15);color:#4ade80;border:1px solid rgba(34,197,94,.3)}
+.badge-reject{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+
+/* NOTIF */
+.notif-item{display:flex;gap:12px;padding:12px 18px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s;align-items:flex-start}
+.notif-item:hover{background:rgba(255,255,255,.03)}
+.notif-item.unread{border-left:3px solid var(--accent)}
+.notif-dot2{width:8px;height:8px;border-radius:50%;margin-top:5px;flex-shrink:0}
+.notif-dot2.orange{background:var(--accent)}
+.notif-dot2.blue{background:var(--blue)}
+.notif-dot2.red{background:var(--red)}
+.notif-dot2.green{background:var(--green)}
+.notif-dot2.purple{background:var(--purple)}
+.notif-body{flex:1}
+.notif-text{font-size:12px;line-height:1.5}
+.notif-text b{color:var(--accent)}
+.notif-time{font-size:10px;color:var(--muted);margin-top:3px}
+
+/* MODULE BTNS */
+.module-btn{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px 16px;cursor:pointer;transition:all .2s;display:flex;flex-direction:column;gap:8px}
+.module-btn:hover{border-color:var(--accent);background:rgba(245,166,35,.05);transform:translateY(-1px)}
+.module-icon{font-size:24px}
+.module-name{font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.module-desc{font-size:11px;color:var(--muted);line-height:1.4}
+.module-count{font-size:11px;font-weight:600;color:var(--accent)}
+
+/* PROGRESS */
+.progress-bar{background:var(--bg3);border-radius:4px;height:6px;overflow:hidden;margin-top:6px}
+.progress-fill{height:100%;border-radius:4px;background:var(--accent)}
+.progress-fill.blue{background:var(--blue)}
+.progress-fill.green{background:var(--green)}
+.progress-fill.red{background:var(--red)}
+.budowa-row{padding:12px 0;border-bottom:1px solid var(--border)}
+.budowa-row:last-child{border-bottom:none}
+.budowa-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.budowa-name{font-size:13px;font-weight:600}
+.budowa-pct{font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:700}
+.budowa-meta{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:6px}
+
+/* TABS */
+.tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px}
+.tab{padding:10px 18px;font-size:12px;font-weight:600;letter-spacing:.5px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;color:var(--muted);transition:all .15s}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover:not(.active){color:var(--text)}
+
+/* MODAL */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border);border-top:3px solid var(--accent);border-radius:12px;width:580px;max-width:95vw;max-height:85vh;overflow-y:auto}
+.modal-header{padding:20px 24px 16px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between}
+.modal-title{font-family:'Barlow Condensed',sans-serif;font-size:20px;font-weight:700;letter-spacing:1px}
+.modal-close{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:2px}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:20px 24px}
+.modal-footer{padding:16px 24px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
+.new-id-box{background:var(--bg);border:1px solid var(--accent);border-radius:6px;padding:10px 14px;font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:700;color:var(--accent);letter-spacing:2px;text-align:center;margin-bottom:6px}
+.id-sub{text-align:center;font-size:11px;color:var(--muted);margin-bottom:16px}
+.scrollable{max-height:360px;overflow-y:auto}
+
+/* SEARCH BAR */
+.search-bar{display:flex;gap:8px;align-items:center;padding:12px 18px;border-bottom:1px solid var(--border)}
+
+/* FOOTER */
+.footer{border-top:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--muted);background:var(--bg2);flex-shrink:0}
+.status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:6px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* TOAST */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px 24px;font-size:13px;color:var(--text);z-index:999;opacity:0;transition:all .3s;white-space:nowrap;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.warn{border-color:var(--yellow);color:var(--yellow)}
+
+@media(max-width:900px){
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .two-col,.three-col{grid-template-columns:1fr}
+  .sidebar{display:none}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════ LOGIN SCREEN ═══════════════ -->
+<div id="loginScreen">
+  <div class="login-box">
+
+    <!-- LOGOWANIE -->
+    <div id="loginForm">
+      <div class="login-logo">
+        <div class="login-badge">D.B.F.</div>
+        <div>
+          <div class="login-title">Dziennik Budowy Firmy</div>
+        </div>
+      </div>
+      <div class="login-company">
+        Konsorcjum:<br>
+        <strong>MP Budownictwo Finanse sp. z o.o.</strong><br>
+        <strong>Artbud sp. z o.o.</strong>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Email służbowy</label>
+        <input class="form-input" id="loginEmail" type="email"
+          placeholder="jan.kowalski@mpbudownictwo.pl" onkeydown="loginEnter(event)">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Hasło</label>
+        <input class="form-input" id="loginPass" type="password"
+          placeholder="••••••••" onkeydown="loginEnter(event)">
+      </div>
+      <div class="login-error" id="loginError"></div>
+      <button class="btn btn-primary" onclick="doLogin()">Zaloguj się →</button>
+      <div style="text-align:center;margin-top:20px;font-size:13px;color:var(--muted)">
+        Nie masz konta?
+        <span onclick="pokazRejestracje()" style="color:var(--accent);cursor:pointer;font-weight:600"> Zarejestruj się →</span>
+      </div>
+    </div>
+
+    <!-- REJESTRACJA -->
+    <div id="rejestracjaForm" style="display:none">
+      <div class="login-logo">
+        <div class="login-badge">D.B.F.</div>
+        <div>
+          <div class="login-title">Nowe konto firmy</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:24px">
+        14 dni za darmo · Bez karty płatniczej
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Nazwa firmy *</label>
+        <input class="form-input" id="regNazwaFirmy" placeholder="np. Kowalski Budownictwo sp. z o.o.">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email *</label>
+        <input class="form-input" id="regEmail" type="email" placeholder="biuro@firma.pl">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Hasło *</label>
+        <input class="form-input" id="regHaslo" type="password" placeholder="Min. 6 znaków">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Powtórz hasło *</label>
+        <input class="form-input" id="regHaslo2" type="password" placeholder="Powtórz hasło">
+      </div>
+      <div class="login-error" id="regError"></div>
+      <button class="btn btn-primary" onclick="doRejestracja()">Utwórz konto →</button>
+      <div style="text-align:center;margin-top:20px;font-size:13px;color:var(--muted)">
+        Masz już konto?
+        <span onclick="pokazLogowanie()" style="color:var(--accent);cursor:pointer;font-weight:600"> Zaloguj się →</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════ APP SCREEN ═══════════════ -->
+<div id="appScreen" style="flex-direction:column">
+
+  <!-- DEMO BANNER -->
+  <div id="demoBanner">
+    ⚡ <strong>Tryb DEMO</strong> — dane lokalne, nie zapisywane do chmury.
+    Aby aktywować Firebase: wklej konfigurację w sekcji firebaseConfig w kodzie.
+    <span style="margin-left:auto;opacity:.6;font-size:10px">D.B.F. v1.0</span>
+  </div>
+
+  <!-- TOPBAR -->
+  <div class="topbar">
+    <div class="logo">
+      <div class="logo-badge">D.B.F.</div>
+      <div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:600;color:var(--muted);letter-spacing:1px;text-transform:uppercase">Dziennik Budowy Firmy</div>
+        <div class="logo-sub">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button class="notif-btn" onclick="openModal('notifModal')" title="Powiadomienia">
+        🔔
+        <span id="notifBadge"></span>
+      </button>
+      <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowa Sprawa</button>
+      <div class="user-pill" onclick="doLogout()">
+        <div class="user-avatar">KB</div>
+        <span id="userLabel">Użytkownik · KB</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYOUT -->
+  <div class="layout">
+
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="sidebar-section">Nawigacja</div>
+      <div class="nav-item active" onclick="showTab('dashboard');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🏠</span> Dashboard
+      </div>
+      <div class="nav-item" onclick="showTab('sprawy');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">📋</span> Wszystkie Sprawy
+      </div>
+
+      <div class="sidebar-section">Moduły</div>
+      <div class="nav-item" onclick="showTab('kb');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🏗️</span> KB — Kierownik
+      </div>
+      <div class="nav-item" onclick="showTab('wlasciciel');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">👔</span> W — Właściciel
+      </div>
+      <div class="nav-item" onclick="showTab('ekipa');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">👷</span> SE — Szef Ekipy
+      </div>
+      <div class="nav-item" onclick="showTab('pta');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🗂️</span> PTA — Tech-Admin
+      </div>
+      <div class="nav-item" onclick="showTab('ini');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🔍</span> INI — Insp. Nadzoru
+        <span class="nav-badge yellow">2</span>
+      </div>
+      <div class="nav-item" onclick="showTab('kz');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🏛️</span> KZ — Kons. Zabytków
+      </div>
+      <div class="nav-item" onclick="showTab('mat');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">🧱</span> MAT — Materiały
+      </div>
+
+      <div class="sidebar-section">System</div>
+      <div class="nav-item" onclick="showTab('ustawienia');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">⚙️</span> Ustawienia firmy
+      </div>
+      <div class="nav-item" onclick="showTab('uzytkownicy');this.closest('.sidebar').querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));this.classList.add('active')">
+        <span class="icon">👥</span> Użytkownicy
+      </div>
+      <div class="nav-item" onclick="openModal('notifModal')">
+        <span class="icon">🔔</span> Powiadomienia
+        <span class="nav-badge" id="sidebarNotifBadge">5</span>
+      </div>
+      <div class="nav-item" onclick="openModal('hasloModal')">
+        <span class="icon">🔑</span> Zmień hasło
+      </div>
+      <div class="nav-item" onclick="doLogout()">
+        <span class="icon">🚪</span> Wyloguj
+      </div>
+    </div>
+
+    <!-- MAIN -->
+    <div class="main">
+
+      <!-- ── DASHBOARD ── -->
+      <div id="tab-dashboard" class="tab-content active">
+        <div class="page-header">
+          <div>
+            <div class="page-title">DASHBOARD</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub" id="dashDate"></div>
+          </div>
+          <button class="btn btn-ghost">📥 Eksport raportu</button>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card orange">
+            <div class="stat-label">Wszystkie Sprawy</div>
+            <div class="stat-value" id="statTotal">—</div>
+            <div class="stat-sub">w systemie</div>
+            <div class="stat-icon">📋</div>
+          </div>
+          <div class="stat-card blue">
+            <div class="stat-label">Do Zatwierdzenia</div>
+            <div class="stat-value" id="statZatw">—</div>
+            <div class="stat-sub">wymagają akcji</div>
+            <div class="stat-icon">⏳</div>
+          </div>
+          <div class="stat-card green">
+            <div class="stat-label">W Toku</div>
+            <div class="stat-value" id="statToku">—</div>
+            <div class="stat-sub">aktywne</div>
+            <div class="stat-icon">⚡</div>
+          </div>
+          <div class="stat-card red">
+            <div class="stat-label">Nowe</div>
+            <div class="stat-value" id="statNowe">—</div>
+            <div class="stat-sub">nieprzypisane</div>
+            <div class="stat-icon">🆕</div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">📋 Ostatnie Sprawy</span>
+              <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px"
+                onclick="showTab('sprawy')">Wszystkie →</button>
+            </div>
+            <div class="sprawa-list" id="dashSprawy"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">🔔 Powiadomienia</span>
+            </div>
+            <div class="scrollable" id="notifList"></div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><span class="card-title">🏗️ Postęp Budów</span></div>
+            <div class="card-body">
+              <div class="budowa-row">
+                <div class="budowa-top"><div class="budowa-name">Budowa 1</div><div class="budowa-pct" style="color:var(--muted)">—</div></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
+                <div class="budowa-meta"><span>KB: —</span><span>Termin: —</span></div>
+              </div>
+              <div class="budowa-row">
+                <div class="budowa-top"><div class="budowa-name">Budowa 2</div><div class="budowa-pct" style="color:var(--muted)">—</div></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
+                <div class="budowa-meta"><span>KB: —</span><span>Termin: —</span></div>
+              </div>
+              <div class="budowa-row">
+                <div class="budowa-top"><div class="budowa-name">Budowa 3</div><div class="budowa-pct" style="color:var(--muted)">—</div></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
+                <div class="budowa-meta"><span>KB: —</span><span>Termin: —</span></div>
+              </div>
+              <div class="budowa-row">
+                <div class="budowa-top"><div class="budowa-name">Budowa 4</div><div class="budowa-pct" style="color:var(--muted)">—</div></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
+                <div class="budowa-meta"><span>KB: —</span><span>Termin: —</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header"><span class="card-title">📦 Szybki dostęp</span></div>
+            <div style="padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px">
+              <div class="module-btn" onclick="openModal('nowaSprawaModal')"><div class="module-icon">➕</div><div class="module-name">Nowa Sprawa</div><div class="module-desc">Utwórz i wyślij powiadomienie</div></div>
+              <div class="module-btn" onclick="showTab('sprawy')"><div class="module-icon">📋</div><div class="module-name">Wszystkie Sprawy</div><div class="module-desc">Pełny rejestr systemu</div></div>
+              <div class="module-btn" onclick="showTab('ini')"><div class="module-icon">🔍</div><div class="module-name">Moduł INI</div><div class="module-desc">Inspektor nadzoru</div></div>
+              <div class="module-btn" onclick="showTab('kz')"><div class="module-icon">🏛️</div><div class="module-name">Moduł KZ</div><div class="module-desc">Konserwator zabytków</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── WSZYSTKIE SPRAWY ── -->
+      <div id="tab-sprawy" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">WSZYSTKIE SPRAWY</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowa Sprawa</button>
+        </div>
+        <div class="card">
+          <div class="search-bar">
+            <input class="form-input" style="width:220px" placeholder="🔍 Szukaj ID, tytułu..."
+              oninput="searchSprawy(this.value)">
+            <select class="form-select" style="width:140px" onchange="filterSprawy(this.value)">
+              <option value="">Wszystkie moduły</option>
+              <option>KB</option><option>KF</option><option>KZM</option>
+              <option>DWU</option><option>BHP</option><option>UMO</option>
+              <option>ROB</option><option>INI</option><option>KZ</option><option>WKZ</option>
+            </select>
+            <select class="form-select" style="width:140px">
+              <option>Wszystkie statusy</option>
+              <option>Nowa</option><option>W toku</option>
+              <option>Do zatwierdzenia</option><option>Zamknięta</option>
+            </select>
+          </div>
+          <div class="sprawa-list" id="sprawyList"></div>
+        </div>
+      </div>
+
+      <!-- ── KB ── -->
+      <div id="tab-kb" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">🏗️ KB — KIEROWNIK BUDOWY</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub">Dziennik, protokoły, harmonogram, dokumentacja</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowy wpis</button>
+        </div>
+
+        <!-- AI ANALIZA ZDJĘĆ -->
+        <div class="card" style="margin-bottom:16px;border-color:rgba(245,166,35,0.4)">
+          <div class="card-header" style="background:rgba(245,166,35,0.05)">
+            <span class="card-title">🤖 AI Analiza Zdjęcia Budowy</span>
+            <span style="font-size:11px;color:var(--muted)">Wynik trafia automatycznie do Dziennika Budowy</span>
+          </div>
+          <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div>
+                <div class="form-group">
+                  <label class="form-label">Wgraj zdjęcie budowy *</label>
+                  <input type="file" accept="image/*" id="aiZdjecieInput"
+                    style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:13px"
+                    onchange="podgladAIZdjecie(this)">
+                  <div id="aiZdjeciePreview" style="margin-top:10px"></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label class="form-label">Budowa</label>
+                    <select class="form-select" id="aiBudowa">
+                      <option>Budowa 1</option>
+                      <option>Budowa 2</option>
+                      <option>Budowa 3</option>
+                      <option>Budowa 4</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Kontekst (opcjonalnie)</label>
+                    <input class="form-input" id="aiKontekst" placeholder="np. fundamenty, dach, instalacje">
+                  </div>
+                </div>
+                <button class="btn btn-primary" style="width:100%" onclick="analizujZdjecie()">
+                  🤖 Analizuj zdjęcie przez AI →
+                </button>
+              </div>
+
+              <div>
+                <label class="form-label">Wynik analizy AI</label>
+                <div id="aiWynik" style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:180px;font-size:13px;line-height:1.7;color:var(--muted)">
+                  Wgraj zdjęcie i kliknij „Analizuj" — AI oceni stan budowy i automatycznie doda wpis do Dziennika Budowy.
+                </div>
+                <div id="aiStatus" style="margin-top:8px;font-size:12px"></div>
+              </div>
+            </div>
+
+            <!-- DZIENNIK -->
+            <div style="margin-top:20px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <label class="form-label" style="margin:0">📖 Dziennik Budowy — Ostatnie wpisy AI</label>
+                <span style="font-size:11px;color:var(--muted)" id="dziennikaCount"></span>
+              </div>
+              <div id="dziennikaLista" style="display:flex;flex-direction:column;gap:8px">
+                <div style="padding:12px;color:var(--muted);font-size:13px;text-align:center">
+                  Brak wpisów. Wgraj pierwsze zdjęcie budowy!
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI ANALIZA DOKUMENTU PRZYCHODOWEGO -->
+        <div class="card" style="margin-bottom:16px;border-color:rgba(59,130,246,0.4)">
+          <div class="card-header" style="background:rgba(59,130,246,0.05)">
+            <span class="card-title">📦 AI Odczyt Dokumentu Przychodowego</span>
+            <span style="font-size:11px;color:var(--muted)">Faktura / WZ / Protokół odbioru → automatyczny wpis w Materiałach</span>
+          </div>
+          <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div>
+                <div class="form-group">
+                  <label class="form-label">Wgraj zdjęcie dokumentu *</label>
+                  <input type="file" accept="image/*,application/pdf" id="aiDokInput"
+                    style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:13px"
+                    onchange="podgladDokument(this)">
+                  <div id="aiDokPreview" style="margin-top:10px"></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label class="form-label">Typ dokumentu</label>
+                    <select class="form-select" id="aiDokTyp">
+                      <option value="faktura">Faktura VAT</option>
+                      <option value="wz">WZ — Wydanie Zewnętrzne</option>
+                      <option value="protokol">Protokół odbioru materiałów</option>
+                      <option value="inny">Inny dokument</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Budowa</label>
+                    <select class="form-select" id="aiDokBudowa">
+                      <option>Budowa 1</option>
+                      <option>Budowa 2</option>
+                      <option>Budowa 3</option>
+                      <option>Budowa 4</option>
+                    </select>
+                  </div>
+                </div>
+                <button class="btn" style="width:100%;background:var(--blue);color:#fff;padding:10px;font-weight:700;border:none;border-radius:6px;cursor:pointer;font-size:14px" onclick="analizujDokument()">
+                  🤖 Odczytaj dokument przez AI →
+                </button>
+              </div>
+
+              <div>
+                <label class="form-label">Odczytane dane</label>
+                <div id="aiDokWynik" style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:180px;font-size:13px;line-height:1.7;color:var(--muted)">
+                  Wgraj zdjęcie faktury lub WZ — AI odczyta dane i automatycznie doda materiały do rejestru.
+                </div>
+                <div id="aiDokStatus" style="margin-top:8px;font-size:12px"></div>
+              </div>
+            </div>
+
+            <!-- OSTATNIE DOKUMENTY -->
+            <div style="margin-top:20px">
+              <label class="form-label">📋 Ostatnie zeskanowane dokumenty</label>
+              <div id="dokListaAI" style="display:flex;flex-direction:column;gap:8px">
+                <div style="padding:12px;color:var(--muted);font-size:13px;text-align:center">
+                  Brak zeskanowanych dokumentów.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="three-col">
+          <div class="module-btn"><div class="module-icon">📖</div><div class="module-name">Dziennik Budowy</div><div class="module-desc">Wpisy dzienne, pogoda, stan robót</div></div>
+          <div class="module-btn"><div class="module-icon">✅</div><div class="module-name">Protokoły Odbioru</div><div class="module-desc">Odbiory robót częściowe i końcowe</div></div>
+          <div class="module-btn"><div class="module-icon">📅</div><div class="module-name">Harmonogram</div><div class="module-desc">Plan rzeczowo-finansowy</div></div>
+          <div class="module-btn"><div class="module-icon">📸</div><div class="module-name">Dokumentacja foto</div><div class="module-desc">Zdjęcia z tagiem GPS i datą</div></div>
+          <div class="module-btn"><div class="module-icon">➕</div><div class="module-name">Roboty Dodatkowe</div><div class="module-desc">Wnioski, wyceny, zatwierdzenia</div></div>
+          <div class="module-btn"><div class="module-icon">👥</div><div class="module-name">Podwykonawcy</div><div class="module-desc">Nadzór, protokoły, rozliczenia</div></div>
+        </div>
+      </div>
+
+      <!-- ── WŁAŚCICIEL ── -->
+      <div id="tab-wlasciciel" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">👔 W — WŁAŚCICIEL</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card orange"><div class="stat-label">Przychody YTD</div><div class="stat-value">2,4M</div><div class="stat-sub">+18% vs rok poprzedni</div></div>
+          <div class="stat-card blue"><div class="stat-label">Koszty YTD</div><div class="stat-value">1,8M</div><div class="stat-sub">w budżecie</div></div>
+          <div class="stat-card green"><div class="stat-label">Marża</div><div class="stat-value">25%</div><div class="stat-sub">cel: 22%</div></div>
+          <div class="stat-card red"><div class="stat-label">Do zatwierdzenia</div><div class="stat-value" id="statZatw2">—</div><div class="stat-sub">umowy i kosztorysy</div></div>
+        </div>
+      </div>
+
+      <!-- ── SE ── -->
+      <div id="tab-ekipa" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">👷 SE — SZEF EKIPY</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub">Raporty dzienne, narzędzia, paliwo, materiały</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Raport dzienny</button>
+        </div>
+        <div class="three-col">
+          <div class="module-btn"><div class="module-icon">📊</div><div class="module-name">Raport Dzienny</div><div class="module-desc">Pracownicy, godziny, roboty</div></div>
+          <div class="module-btn"><div class="module-icon">🔧</div><div class="module-name">Karty Narzędziowe</div><div class="module-desc">Wydanie i zwrot sprzętu</div></div>
+          <div class="module-btn"><div class="module-icon">⛽</div><div class="module-name">Karty Paliwowe</div><div class="module-desc">Tankowania, pojazdy, sprzęt</div></div>
+          <div class="module-btn"><div class="module-icon">📦</div><div class="module-name">Odbiór Materiałów</div><div class="module-desc">Przyjęcie na budowę</div></div>
+          <div class="module-btn"><div class="module-icon">🚨</div><div class="module-name">Zgłoszenia</div><div class="module-desc">Problemy, wnioski, incydenty</div></div>
+          <div class="module-btn"><div class="module-icon">➕</div><div class="module-name">Roboty Dodatkowe</div><div class="module-desc">Wniosek do KB</div></div>
+        </div>
+      </div>
+
+      <!-- ── PTA ── -->
+      <div id="tab-pta" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">🗂️ PTA — TECHNICZNO-ADMINISTRACYJNY</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub">KF · DWU · KZM · BHP · UMO · ROB+</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowy dokument</button>
+        </div>
+        <div class="tabs">
+          <div class="tab active" onclick="switchPtaTab(this,'kf')">💰 KF</div>
+          <div class="tab" onclick="switchPtaTab(this,'kzm')">📄 KZM</div>
+          <div class="tab" onclick="switchPtaTab(this,'dvu')">📋 DWU</div>
+          <div class="tab" onclick="switchPtaTab(this,'bhp')">⚠️ BHP</div>
+          <div class="tab" onclick="switchPtaTab(this,'umo')">📝 Umowy</div>
+          <div class="tab" onclick="switchPtaTab(this,'rob')">➕ Roboty Dod.</div>
+        </div>
+        <div id="pta-kf" class="tab-content active">
+          <div class="card"><div class="card-header"><span class="card-title">Księgowość i Finanse — KF</span></div>
+          <div class="sprawa-list" id="ptaKfList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        </div>
+        <div id="pta-kzm" class="tab-content">
+          <div class="card"><div class="card-header"><span class="card-title">Karty Zatwierdzenia Materiałowego — KZM</span></div>
+          <div class="sprawa-list" id="ptaKzmList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        </div>
+        <div id="pta-dvu" class="tab-content"><div class="card"><div class="card-header"><span class="card-title">Deklaracje Właściwości Użytkowych — DWU</span></div><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        <div id="pta-bhp" class="tab-content">
+          <div class="card"><div class="card-header"><span class="card-title">BHP</span></div>
+          <div class="sprawa-list" id="ptaBhpList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        </div>
+        <div id="pta-umo" class="tab-content">
+          <div class="card"><div class="card-header"><span class="card-title">Umowy — UMO</span></div>
+          <div class="sprawa-list" id="ptaUmoList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        </div>
+        <div id="pta-rob" class="tab-content">
+          <div class="card"><div class="card-header"><span class="card-title">Roboty Dodatkowe — ROB+</span></div>
+          <div class="sprawa-list" id="ptaRobList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak dokumentów. Utwórz pierwszy.</div></div></div>
+        </div>
+      </div>
+
+      <!-- ── INI ── -->
+      <div id="tab-ini" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">🔍 INI — INSPEKTOR NADZORU INWESTORSKIEGO</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub">Roboty publiczne · Nadzór, odbiory, korespondencja z Zamawiającym</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowy wpis INI</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">📋 Polecenia INI i Korespondencja</span></div>
+          <div class="sprawa-list" id="iniList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak wpisów. Utwórz pierwszy.</div></div>
+        </div>
+        <div class="three-col">
+          <div class="module-btn"><div class="module-icon">📖</div><div class="module-name">Wpisy Dziennika</div><div class="module-desc">Kontrasygnata INI — wymagana prawnie</div></div>
+          <div class="module-btn"><div class="module-icon">✅</div><div class="module-name">Protokoły Odbioru</div><div class="module-desc">Podpis INI obowiązkowy</div></div>
+          <div class="module-btn"><div class="module-icon">📊</div><div class="module-name">Raporty dla Instytucji</div><div class="module-desc">GDDKiA, UM, NFOŚiGW</div></div>
+          <div class="module-btn"><div class="module-icon">📬</div><div class="module-name">Korespondencja z Zamawiającym</div><div class="module-desc">Wyłącznie przez system</div></div>
+          <div class="module-btn"><div class="module-icon">⚡</div><div class="module-name">Niezgodności</div><div class="module-desc">Rejestr i decyzje korygujące</div></div>
+          <div class="module-btn"><div class="module-icon">📐</div><div class="module-name">Inwentaryzacje</div><div class="module-desc">Geodezja, obmiary</div></div>
+        </div>
+      </div>
+
+      <!-- ── KZ ── -->
+      <div id="tab-kz" class="tab-content">
+        <div class="page-header">
+          <div>
+            <div class="page-title">🏛️ KZ — KONSERWATOR ZABYTKÓW</div>
+            <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+            <div class="page-sub">Prace konserwatorskie · Dziennik · Dokumentacja · WKZ</div>
+          </div>
+          <button class="btn btn-primary" onclick="openModal('nowaSprawaModal')">+ Nowy wpis KZ</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">📖 Dziennik i Korespondencja WKZ</span></div>
+          <div class="sprawa-list" id="kzList"><div style="padding:18px;color:var(--muted);font-size:13px">Brak wpisów. Utwórz pierwszy.</div></div>
+        </div>
+        <div class="three-col">
+          <div class="module-btn" style="border-color:var(--purple)"><div class="module-icon">🔎</div><div class="module-name">Odkrycia i Znaleziska</div><div class="module-desc">Dokumentacja architektoniczna i ruchoma</div></div>
+          <div class="module-btn"><div class="module-icon">🧱</div><div class="module-name">KZM Konserwatorskie</div><div class="module-desc">Wapno NHL, tras, zaprawy historyczne</div></div>
+          <div class="module-btn"><div class="module-icon">📸</div><div class="module-name">Dokumentacja Foto</div><div class="module-desc">Przed / w trakcie / po pracach</div></div>
+          <div class="module-btn"><div class="module-icon">📜</div><div class="module-name">Decyzje WKZ</div><div class="module-desc">Rejestr decyzji i daty ważności</div></div>
+          <div class="module-btn"><div class="module-icon">📋</div><div class="module-name">Program Prac</div><div class="module-desc">Zatwierdzony program, zmiany, aneksy</div></div>
+          <div class="module-btn"><div class="module-icon">📑</div><div class="module-name">Raport Końcowy</div><div class="module-desc">Dokumentacja powykonawcza dla WKZ</div></div>
+        </div>
+      </div>
+
+    <!-- ── USTAWIENIA ── -->
+    <div id="tab-ustawienia" class="tab-content">
+      <div class="page-header">
+        <div>
+          <div class="page-title">⚙️ USTAWIENIA FIRMY</div>
+          <div class="page-sub">Tylko Właściciel (W1/W2) może zmieniać ustawienia</div>
+        </div>
+        <button class="btn btn-primary" onclick="zapiszUstawienia()">✓ Zapisz ustawienia</button>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-header"><span class="card-title">🏢 Dane firmy</span></div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:14px">
+            <div class="form-group">
+              <label class="form-label">Nazwa firmy / Lider konsorcjum *</label>
+              <input class="form-input" id="uNazwa1" placeholder="np. MP Budownictwo Finanse sp. z o.o."
+                value="MP Budownictwo Finanse sp. z o.o.">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Partner konsorcjum (opcjonalnie)</label>
+              <input class="form-input" id="uNazwa2" placeholder="np. Artbud sp. z o.o."
+                value="Artbud sp. z o.o.">
+            </div>
+            <div class="form-group">
+              <label class="form-label">NIP</label>
+              <input class="form-input" id="uNip" placeholder="000-000-00-00">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Adres siedziby</label>
+              <input class="form-input" id="uAdres" placeholder="ul. Przykładowa 1, 00-000 Warszawa">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Telefon</label>
+              <input class="form-input" id="uTelefon" placeholder="+48 000 000 000">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Email firmy</label>
+              <input class="form-input" id="uEmailFirmy" type="email" placeholder="biuro@firma.pl">
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><span class="card-title">🏗️ Lista budów</span></div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label">Nazwy budów (jedna per linia)</label>
+              <textarea class="form-textarea" id="uBudowyLista" style="min-height:200px"
+                placeholder="Budowa 1&#10;Budowa 2&#10;Budowa 3&#10;Budowa 4">Budowa 1
+Budowa 2
+Budowa 3
+Budowa 4</textarea>
+              <div style="font-size:11px;color:var(--muted);margin-top:6px">
+                Wpisz prawdziwe nazwy budów — będą dostępne we wszystkich formularzach.
+              </div>
+            </div>
+            <div style="background:var(--bg3);border-radius:6px;padding:12px;font-size:12px;color:var(--muted)">
+              💡 Po zapisaniu ustawień nazwy firm i budów zaktualizują się automatycznie w całym systemie.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">👁️ Podgląd — jak pojawi się w systemie</span></div>
+        <div class="card-body">
+          <div style="background:var(--bg);border-radius:8px;padding:16px;display:flex;align-items:center;gap:12px">
+            <div style="background:var(--accent);color:#000;font-family:'Barlow Condensed',sans-serif;font-weight:900;font-size:20px;letter-spacing:2px;padding:4px 10px;clip-path:polygon(0 0,95% 0,100% 100%,5% 100%)">D.B.F.</div>
+            <div>
+              <div style="font-size:13px;font-weight:600;color:var(--muted)">Dziennik Budowy Firmy</div>
+              <div style="font-size:10px;color:var(--muted)" id="podgladNazwa">MP Budownictwo Finanse sp. z o.o. & Artbud sp. z o.o.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── MATERIAŁY ── -->
+    <div id="tab-mat" class="tab-content">
+      <div class="page-header">
+        <div>
+          <div class="page-title">🧱 MAT — MATERIAŁY</div>
+          <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+          <div class="page-sub">Zakupy, kosztorys, porównanie, raport końcowy</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" onclick="openModal('kosztorysModal')">📋 Dodaj kosztorys</button>
+          <button class="btn btn-primary" onclick="openModal('dodajMaterialModal')">+ Dodaj zakup</button>
+        </div>
+      </div>
+
+      <!-- Podsumowanie -->
+      <div id="matSummary" style="margin-bottom:16px"></div>
+
+      <!-- Zakupy -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <span class="card-title">🧾 Zakupione materiały</span>
+        </div>
+        <div id="matLista"></div>
+      </div>
+
+      <!-- Porównanie z kosztorysem -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📊 Porównanie z kosztorysem</span>
+        </div>
+        <div id="matPorownanie"></div>
+      </div>
+    </div>
+
+    <!-- ── UŻYTKOWNICY ── -->
+    <div id="tab-uzytkownicy" class="tab-content">
+      <div class="page-header">
+        <div>
+          <div class="page-title">👥 UŻYTKOWNICY</div>
+          <div class="consortium">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+          <div class="page-sub">Zarządzanie dostępem i rolami</div>
+        </div>
+        <button class="btn btn-primary" onclick="openModal('dodajUzytkownikaModal')">+ Dodaj użytkownika</button>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">👥 Lista użytkowników</span>
+          <span id="uzytkownicyCount" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div id="uzytkownicyList"></div>
+      </div>
+    </div>
+
+    </div><!-- end main -->
+  </div><!-- end layout -->
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <div><span class="status-dot"></span>System online · Chmura: <span id="chmuraStatus">tryb demo</span></div>
+    <div style="font-size:10px">Konsorcjum: <strong style="color:var(--text)">MP Budownictwo Finanse sp. z o.o.</strong> &amp; <strong style="color:var(--text)">Artbud sp. z o.o.</strong></div>
+    <div>D.B.F. v1.0 · © 2025</div>
+  </div>
+
+</div><!-- end appScreen -->
+
+<!-- ═══ MODAL: NOWA SPRAWA ═══ -->
+<div class="modal-overlay" id="nowaSprawaModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">+ NOWA SPRAWA</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">Konsorcjum: MP Budownictwo Finanse sp. z o.o. &amp; Artbud sp. z o.o.</div>
+      </div>
+      <button class="modal-close" onclick="closeModal('nowaSprawaModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="new-id-box" id="generatedId">DBF/25/???/0000</div>
+      <div class="id-sub">ID zostanie nadany po wyborze modułu</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Moduł *</label>
+          <select class="form-select" id="nsModul" onchange="updateId(this.value)">
+            <option value="">— wybierz —</option>
+            <option value="KB">KB — Kierownik Budowy</option>
+            <option value="KF">KF — Księgowość i Finanse</option>
+            <option value="KZM">KZM — Karta Zatwierdzenia Mat.</option>
+            <option value="DWU">DWU — Deklaracja Wł. Użytkowych</option>
+            <option value="BHP">BHP — Bezpieczeństwo</option>
+            <option value="UMO">UMO — Umowa</option>
+            <option value="ROB">ROB — Roboty Dodatkowe</option>
+            <option value="PAL">PAL — Karta Paliwowa</option>
+            <option value="NAR">NAR — Karta Narzędziowa</option>
+            <option value="INI">INI — Inspektor Nadzoru</option>
+            <option value="KZ">KZ — Konserwator Zabytków</option>
+            <option value="WKZ">WKZ — Wniosek do WKZ</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Budowa *</label>
+          <select class="form-select" id="nsBudowa">
+            <option>Budowa 1</option>
+            <option>Budowa 2</option>
+            <option>Budowa 3</option>
+            <option>Budowa 4</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Tytuł sprawy *</label>
+        <input class="form-input" id="nsTytul" placeholder="Krótki, jasny opis sprawy...">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Przypisz do</label>
+          <select class="form-select" id="nsPrzypiszDo">
+            <option value="KB">KB — Kierownik Budowy</option>
+            <option value="W1">W1 — Właściciel 1</option>
+            <option value="W2">W2 — Właściciel 2</option>
+            <option value="SE1">SE1 — Szef Ekipy 1</option>
+            <option value="SE2">SE2 — Szef Ekipy 2</option>
+            <option value="PTA">PTA — Tech-Admin</option>
+            <option value="INI">INI — Inspektor Nadzoru</option>
+            <option value="KZ">KZ — Konserwator Zabytków</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Deadline</label>
+          <input class="form-input" id="nsDeadline" type="date">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Opis / Uwagi</label>
+        <textarea class="form-textarea" id="nsOpis" placeholder="Szczegóły, kontekst, wymagania..."></textarea>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Zdjęcie / Załącznik</label>
+        <input type="file" accept="image/*,application/pdf"
+          style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:13px"
+          onchange="uploadZdjecie(this, 'sprawaZdjeciePreview')">
+        <div id="sprawaZdjeciePreview" style="margin-top:6px"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('nowaSprawaModal')">Anuluj</button>
+      <button class="btn btn-primary" onclick="submitNowaSprawa()">✓ Utwórz Sprawę i Powiadom</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: PODGLĄD SPRAWY ═══ -->
+<div class="modal-overlay" id="sprawaModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" style="color:var(--accent)" id="sprawaModalId"></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px" id="sprawaModalTytul"></div>
+      </div>
+      <button class="modal-close" onclick="closeModal('sprawaModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" id="sprawaModalStatus"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;font-size:12px">
+        <div><span style="color:var(--muted)">Moduł:</span> <span id="sprawaModalModul"></span></div>
+        <div><span style="color:var(--muted)">Budowa:</span> <span id="sprawaModalBudowa"></span></div>
+        <div><span style="color:var(--muted)">Przypisanie:</span> <span id="sprawaModalAutor"></span></div>
+        <div><span style="color:var(--muted)">Utworzono:</span> <span id="sprawaModalCzas"></span></div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Opis sprawy</label>
+        <div style="font-size:13px;line-height:1.6;background:var(--bg3);border-radius:6px;padding:12px" id="sprawaModalOpis"></div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Komentarz do decyzji</label>
+        <textarea class="form-textarea" id="sprawaKomentarz" placeholder="Uwagi, warunki zatwierdzenia lub powód odrzucenia..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('sprawaModal')">Zamknij</button>
+      <button class="btn" style="background:var(--red);color:#fff" onclick="odrzuc()">✕ Odrzuć</button>
+      <button class="btn btn-primary" onclick="zatwierdz()">✓ Zatwierdź i Powiadom</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: POWIADOMIENIA ═══ -->
+<div class="modal-overlay" id="notifModal">
+  <div class="modal" style="width:480px">
+    <div class="modal-header">
+      <div class="modal-title">🔔 Powiadomienia Systemowe</div>
+      <button class="modal-close" onclick="closeModal('notifModal')">✕</button>
+    </div>
+    <div class="scrollable" id="notifModalList"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="markAllRead()">Oznacz wszystkie jako przeczytane</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Set date
+  const d = new Date();
+  const dni = ['Niedziela','Poniedziałek','Wtorek','Środa','Czwartek','Piątek','Sobota'];
+  const mies = ['stycznia','lutego','marca','kwietnia','maja','czerwca','lipca','sierpnia','września','października','listopada','grudnia'];
+  const el = document.getElementById('dashDate');
+  if (el) el.textContent = `${dni[d.getDay()]}, ${d.getDate()} ${mies[d.getMonth()]} ${d.getFullYear()} · Zalogowany jako: ` + (window._currentUser || '—');
+</script>
+
+<!-- ═══ MODAL: DODAJ MATERIAŁ ═══ -->
+<div class="modal-overlay" id="dodajMaterialModal">
+  <div class="modal" style="width:540px">
+    <div class="modal-header">
+      <div class="modal-title">🧱 DODAJ ZAKUP MATERIAŁU</div>
+      <button class="modal-close" onclick="closeModal('dodajMaterialModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Nazwa materiału *</label>
+        <input class="form-input" id="matNazwa" placeholder="np. Beton C25/30, Cegła kratówka, Styropian EPS">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Ilość *</label>
+          <input class="form-input" id="matIlosc" type="number" placeholder="np. 50">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Jednostka</label>
+          <select class="form-select" id="matJednostka">
+            <option>m³</option><option>m²</option><option>mb</option>
+            <option>szt.</option><option>kg</option><option>t</option>
+            <option>kpl</option><option>l</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Cena jednostkowa (zł) *</label>
+          <input class="form-input" id="matCenaJ" type="number" placeholder="np. 320">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Data dostawy *</label>
+          <input class="form-input" id="matData" type="date">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Dostawca *</label>
+          <input class="form-input" id="matDostawca" placeholder="Nazwa firmy dostawcy">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Nr faktury</label>
+          <input class="form-input" id="matFaktura" placeholder="np. FV/2025/0123">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Budowa</label>
+        <select class="form-select" id="matBudowa">
+          <option>Budowa 1</option>
+          <option>Budowa 2</option>
+          <option>Budowa 3</option>
+          <option>Budowa 4</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Zdjęcie faktury / WZ</label>
+        <input type="file" accept="image/*,application/pdf" 
+          style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:13px"
+          onchange="uploadZdjecie(this, 'matZdjeciePreview')">
+        <div id="matZdjeciePreview" style="margin-top:6px"></div>
+      </div>
+      <div style="color:var(--red);font-size:12px;min-height:18px" id="matError"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('dodajMaterialModal')">Anuluj</button>
+      <button class="btn btn-primary" onclick="dodajMaterial()">✓ Dodaj materiał</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: KOSZTORYS ═══ -->
+<div class="modal-overlay" id="kosztorysModal">
+  <div class="modal" style="width:480px">
+    <div class="modal-header">
+      <div class="modal-title">📋 DODAJ POZYCJĘ KOSZTORYSU</div>
+      <button class="modal-close" onclick="closeModal('kosztorysModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Nazwa materiału *</label>
+        <input class="form-input" id="kNazwa" placeholder="np. Beton C25/30">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Ilość planowana *</label>
+          <input class="form-input" id="kIlosc" type="number" placeholder="np. 60">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Jednostka</label>
+          <select class="form-select" id="kJednostka">
+            <option>m³</option><option>m²</option><option>mb</option>
+            <option>szt.</option><option>kg</option><option>t</option>
+            <option>kpl</option><option>l</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Wartość kosztorysowa (zł) *</label>
+        <input class="form-input" id="kWartosc" type="number" placeholder="np. 18000">
+      </div>
+      <div style="color:var(--red);font-size:12px;min-height:18px" id="kError"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('kosztorysModal')">Anuluj</button>
+      <button class="btn btn-primary" onclick="dodajKosztorys()">✓ Dodaj pozycję</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: DODAJ UŻYTKOWNIKA ═══ -->
+<div class="modal-overlay" id="dodajUzytkownikaModal">
+  <div class="modal" style="width:520px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">👥 DODAJ UŻYTKOWNIKA</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">Nowa osoba w systemie D.B.F.</div>
+      </div>
+      <button class="modal-close" onclick="closeModal('dodajUzytkownikaModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Imię *</label>
+          <input class="form-input" id="uImie" placeholder="Jan">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Nazwisko *</label>
+          <input class="form-input" id="uNazwisko" placeholder="Kowalski">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email *</label>
+        <input class="form-input" id="uEmail" type="email" placeholder="jan.kowalski@firma.pl">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Rola *</label>
+          <select class="form-select" id="uRola">
+            <option value="">— wybierz rolę —</option>
+            <option value="W1">W1 — Właściciel</option>
+            <option value="W2">W2 — Właściciel 2</option>
+            <option value="KB">KB — Kierownik Budowy</option>
+            <option value="SE1">SE1 — Szef Ekipy 1</option>
+            <option value="SE2">SE2 — Szef Ekipy 2</option>
+            <option value="SE3">SE3 — Szef Ekipy 3</option>
+            <option value="SE4">SE4 — Szef Ekipy 4</option>
+            <option value="PTA">PTA — Tech-Admin</option>
+            <option value="INI">INI — Inspektor Nadzoru</option>
+            <option value="KZ">KZ — Konserwator Zabytków</option>
+            <option value="Y">Y — Rezerwa</option>
+            <option value="Z">Z — Rezerwa</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Budowa</label>
+          <select class="form-select" id="uBudowa">
+            <option value="Wszystkie">Wszystkie budowy</option>
+            <option value="Budowa 1">Budowa 1</option>
+            <option value="Budowa 2">Budowa 2</option>
+            <option value="Budowa 3">Budowa 3</option>
+            <option value="Budowa 4">Budowa 4</option>
+          </select>
+        </div>
+      </div>
+      <div style="color:var(--red);font-size:12px;min-height:18px" id="uError"></div>
+      <div style="color:var(--green);font-size:12px;min-height:18px" id="uOk"></div>
+      <div style="background:var(--bg3);border-radius:6px;padding:12px;font-size:12px;color:var(--muted);margin-top:8px">
+        💡 Po dodaniu użytkownika wyślij mu hasło tymczasowe. Może je zmienić po zalogowaniu przez menu „Zmień hasło".
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('dodajUzytkownikaModal')">Anuluj</button>
+      <button class="btn btn-primary" onclick="dodajUzytkownika()">✓ Dodaj użytkownika</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: ZMIANA HASŁA ═══ -->
+<div class="modal-overlay" id="hasloModal">
+  <div class="modal" style="width:420px">
+    <div class="modal-header">
+      <div class="modal-title">🔑 ZMIANA HASŁA</div>
+      <button class="modal-close" onclick="closeModal('hasloModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Stare hasło *</label>
+        <input class="form-input" id="starHaslo" type="password" placeholder="Twoje obecne hasło">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Nowe hasło *</label>
+        <input class="form-input" id="noweHaslo" type="password" placeholder="Min. 6 znaków">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Powtórz nowe hasło *</label>
+        <input class="form-input" id="powtHaslo" type="password" placeholder="Powtórz nowe hasło">
+      </div>
+      <div style="color:var(--red);font-size:12px;min-height:18px" id="hasloError"></div>
+      <div style="color:var(--green);font-size:12px;min-height:18px" id="hasloOk"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('hasloModal')">Anuluj</button>
+      <button class="btn btn-primary" onclick="zmienHaslo()">✓ Zmień hasło</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
